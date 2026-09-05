@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Auto Reposter",
+  "description": "Automatic Telegram channel reposting engine with branding replacement, footer customization, bot management, and MTProto feed listener.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

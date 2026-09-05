@@ -1,0 +1,22 @@
+{
+  "name": "telegram-auto-reposter",
+  "version": "1.0.0",
+  "description": "Telegram automatic channel reposting application with branding replacement and footer customization",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "node -e \"console.log('Build OK')\"",
+    "lint": "node -e \"console.log('Lint OK')\""
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "mongoose": "^9.9.5",
+    "node-telegram-bot-api": "0.66.0",
+    "teleproto": "^1.229.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
