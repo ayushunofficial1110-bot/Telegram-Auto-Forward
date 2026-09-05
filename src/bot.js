@@ -22,6 +22,11 @@ const {
   executeChannelPromotion,
   sendPayloadSafely
 } = require('./adminService');
+const {
+  startLeaderElection,
+  cedeLeadership,
+  isLeader
+} = require('./botLeader');
 
 let bot = null;
 let botInfo = null;
@@ -42,7 +47,7 @@ async function initBot() {
   }
 
   try {
-    // 1. Initialize TelegramBot without immediate polling to safely prepare hooks
+    // 1. Initialize TelegramBot without immediate polling
     bot = new TelegramBot(token.trim(), { polling: false });
 
     // 2. Clear any active webhooks that may conflict with long-polling
@@ -52,25 +57,20 @@ async function initBot() {
       console.warn('[BOT] Notice: deleteWebHook completed with:', whErr.message);
     }
 
-    // 3. Register polling and general error handlers
+    // 3. Register polling and general error handlers with 409 Conflict mitigation
     bot.on('polling_error', (error) => {
-      const errCode = error.code || (error.response && error.response.statusCode) || error.message;
-      console.error('[ERROR] [BOT] Polling error:', errCode, error.message);
+      const errMsg = error.message || '';
+      const statusCode = error.response && error.response.statusCode;
 
-      // Auto-recover if polling stopped unexpectedly
-      if (bot && !bot.isPolling()) {
-        console.warn('[BOT] Polling stopped. Re-establishing polling loop in 3 seconds...');
-        setTimeout(async () => {
-          try {
-            if (bot && !bot.isPolling()) {
-              await bot.startPolling();
-              console.log('[BOT] Connected and polling...');
-            }
-          } catch (restartErr) {
-            console.error('[ERROR] [BOT] Failed to restart polling:', restartErr.message);
-          }
-        }, 3000);
+      // Handle 409 Conflict gracefully (another instance/container is polling)
+      if (statusCode === 409 || errMsg.includes('409 Conflict')) {
+        console.warn('[BOT] 409 Conflict detected (another instance or previous connection active). Standing by to prevent conflict...');
+        cedeLeadership('409 Conflict detected');
+        return;
       }
+
+      const errCode = error.code || statusCode || errMsg;
+      console.warn('[BOT] Polling warning:', errCode, errMsg);
     });
 
     bot.on('error', (error) => {
@@ -82,12 +82,8 @@ async function initBot() {
     setupCallbackQueryHandlers();
     setupTextMessageHandler();
 
-    // 5. Start long-polling
-    bot.startPolling().catch((pollErr) => {
-      console.error('[ERROR] [BOT] Polling start error:', pollErr.message);
-    });
-
-    console.log('[BOT] Connected and polling...');
+    // 5. Start single-instance leader election (polls only if this instance is leader)
+    startLeaderElection(bot);
 
     // 6. Fetch bot profile in background to verify bot identity and set botInfo
     bot.getMe().then((me) => {
@@ -128,7 +124,7 @@ function setupCommandHandlers() {
         userDoc = await User.findOneAndUpdate(
           { telegramUserId: userId },
           { username, firstName, updatedAt: new Date() },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: 'after' }
         );
 
         // Process referral link if provided
@@ -1631,11 +1627,22 @@ function getBotInstance() {
 }
 
 function isBotConnected() {
-  return bot !== null && typeof bot.isPolling === 'function' && bot.isPolling();
+  return bot !== null;
+}
+
+function getBotStatus() {
+  return {
+    initialized: bot !== null,
+    polling: bot !== null && typeof bot.isPolling === 'function' && bot.isPolling(),
+    mode: isLeader() ? 'leader' : 'standby',
+    username: botInfo ? botInfo.username : null
+  };
 }
 
 module.exports = {
   initBot,
   getBotInstance,
-  isBotConnected
+  isBotConnected,
+  getBotStatus,
+  isLeader
 };

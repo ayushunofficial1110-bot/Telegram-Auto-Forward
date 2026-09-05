@@ -31,7 +31,7 @@ console.warn = function (...args) {
 };
 
 const { connectDatabase, getDatabaseStatus } = require('./src/database');
-const { initBot, isBotConnected } = require('./src/bot');
+const { initBot, isBotConnected, getBotStatus } = require('./src/bot');
 const { initTelegramClient, isMTProtoConnected } = require('./src/telegramClient');
 const { setBotInstance, handleIncomingMessage } = require('./src/repostEngine');
 
@@ -62,9 +62,7 @@ app.get('/status', (req, res) => {
     status: 'ok',
     service: 'Auto Reposter',
     components: {
-      bot: {
-        connected: isBotConnected()
-      },
+      bot: getBotStatus(),
       database: getDatabaseStatus(),
       mtproto: {
         connected: isMTProtoConnected()
