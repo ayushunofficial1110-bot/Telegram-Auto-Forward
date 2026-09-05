@@ -129,9 +129,26 @@ function setupCommandHandlers() {
 
         // Process referral link if provided
         if (startParam) {
-          const refResult = await recordReferralStart(userId, startParam);
+          const refResult = await recordReferralStart(userId, startParam, bot, {
+            username,
+            firstName
+          });
+
           if (refResult && refResult.success) {
-            console.log(`[REFERRAL] Recorded pending referral: ${refResult.referrerId} <- ${userId}`);
+            console.log(`[REFERRAL] Successfully credited referral: ${refResult.referrerId} <- ${userId}`);
+            await bot.sendMessage(
+              chatId,
+              `🎉 <b>Welcome!</b> You joined through an invite link. Enjoy auto-forwarding!`,
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+          } else if (refResult && refResult.error === 'self_referral') {
+            await bot.sendMessage(
+              chatId,
+              `⚠️ <i>Notice: You cannot refer yourself. Share your invite link with friends to earn Ad-Free rewards!</i>`,
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+          } else if (refResult && refResult.error === 'already_referred') {
+            console.log(`[REFERRAL] User ${userId} was already referred previously by ${refResult.referrerId}`);
           }
         }
       } catch (err) {
@@ -202,10 +219,7 @@ async function sendMainMenu(chatId, name, isAdminFlag = null) {
     inline_keyboard: [
       [{ text: '➕ Create Auto Forward', callback_data: 'menu_create' }],
       [{ text: '🔄 My Auto Forwards', callback_data: 'menu_list' }],
-      [
-        { text: '📢 Platform Promotions', callback_data: 'menu_promotions' },
-        { text: '👥 Refer & Earn', callback_data: 'menu_referrals' }
-      ],
+      [{ text: '👥 Refer & Earn', callback_data: 'menu_referrals' }],
       [
         { text: '💬 Contact Support', callback_data: 'menu_support' },
         { text: '⚙️ Settings', callback_data: 'menu_settings' }
@@ -271,7 +285,7 @@ async function showReferralsMenu(chatId, userId) {
     `• 50 referrals ➔ Lifetime ad-free\n\n` +
     `Your Referral Link:\n` +
     `<code>${referralLink}</code>\n\n` +
-    `<i>Note: A referral becomes successful only after the referred user completes their basic bot setup by activating their first auto-forward rule.</i>`;
+    `<i>Share your link with friends. When someone starts the bot using your link, your referral count increases immediately and unlocks Ad-Free rewards!</i>`;
 
   bot.sendMessage(chatId, text, {
     parse_mode: 'HTML',

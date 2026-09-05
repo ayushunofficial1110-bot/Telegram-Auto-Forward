@@ -1,16 +1,26 @@
 const User = require('../models/User');
 const Referral = require('../models/Referral');
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /**
- * Parses and processes a referral link when a user sends /start ref_XXXX
+ * Parses and processes a referral link when a user sends /start ref_XXXX or /start XXXX
+ * Immediately credits the referrer, updates milestone rewards, and notifies the referrer via Telegram bot message.
  */
-async function recordReferralStart(referredUserId, startParam) {
+async function recordReferralStart(referredUserId, startParam, botInstance = null, referredUserInfo = {}) {
   if (!startParam) return null;
 
-  // Expected format: "ref_123456789" or "123456789"
-  const cleanReferrerId = String(startParam).replace(/^ref_?/i, '').trim();
+  // Expected format: "ref_123456789", "ref123456789", or "123456789"
+  const rawParam = String(startParam).trim();
+  let cleanReferrerId = rawParam.replace(/^ref_?/i, '').trim();
 
-  if (!cleanReferrerId || !/^\d+$/.test(cleanReferrerId)) {
+  if (!cleanReferrerId) {
     return null;
   }
 
@@ -20,34 +30,135 @@ async function recordReferralStart(referredUserId, startParam) {
   }
 
   try {
-    // Check if referred user already exists with an assigned referrer
+    // If cleanReferrerId is not numeric, try looking up user by username
+    let referrerUser = null;
+    if (/^\d+$/.test(cleanReferrerId)) {
+      referrerUser = await User.findOne({ telegramUserId: cleanReferrerId });
+    } else {
+      referrerUser = await User.findOne({
+        username: new RegExp(`^@?${cleanReferrerId}$`, 'i')
+      });
+      if (referrerUser) {
+        cleanReferrerId = referrerUser.telegramUserId;
+      } else {
+        console.warn(`[REFERRAL] Referrer not found for param: ${cleanReferrerId}`);
+        return { error: 'referrer_not_found' };
+      }
+    }
+
+    // Double-check self-referral after username resolution
+    if (cleanReferrerId === String(referredUserId)) {
+      return { error: 'self_referral' };
+    }
+
+    // Check if referred user already has an assigned referrer
     const existingUser = await User.findOne({ telegramUserId: String(referredUserId) });
     if (existingUser && existingUser.referredBy) {
-      return { error: 'duplicate_referral', referrerId: existingUser.referredBy };
+      return { error: 'already_referred', referrerId: existingUser.referredBy };
     }
 
-    // Check if a referral record already exists for this referred user
+    // Check if a referral record already exists for this referred user and was rewarded
     const existingReferral = await Referral.findOne({ referredId: String(referredUserId) });
-    if (existingReferral) {
-      return { error: 'duplicate_referral', referrerId: existingReferral.referrerId };
+    if (existingReferral && existingReferral.rewardApplied) {
+      return { error: 'already_referred', referrerId: existingReferral.referrerId };
     }
 
-    // Create a pending referral record
-    await Referral.create({
-      referrerId: cleanReferrerId,
-      referredId: String(referredUserId),
-      status: 'pending',
-      rewardApplied: false
-    });
-
-    // Update the referred user's record
-    await User.findOneAndUpdate(
-      { telegramUserId: String(referredUserId) },
-      { referredBy: cleanReferrerId },
+    // 1. Create or update the completed referral record
+    await Referral.findOneAndUpdate(
+      { referredId: String(referredUserId) },
+      {
+        referrerId: cleanReferrerId,
+        referredId: String(referredUserId),
+        status: 'completed',
+        rewardApplied: true,
+        completedAt: new Date(),
+        createdAt: new Date()
+      },
       { upsert: true }
     );
 
-    return { success: true, referrerId: cleanReferrerId };
+    // 2. Update referred user's record with referredBy
+    await User.findOneAndUpdate(
+      { telegramUserId: String(referredUserId) },
+      { referredBy: cleanReferrerId, updatedAt: new Date() },
+      { upsert: true }
+    );
+
+    // 3. Increment referrer's count & calculate rewards
+    if (!referrerUser) {
+      referrerUser = await User.findOne({ telegramUserId: cleanReferrerId });
+    }
+
+    if (!referrerUser) {
+      referrerUser = new User({
+        telegramUserId: cleanReferrerId,
+        referralCount: 0,
+        createdAt: new Date()
+      });
+    }
+
+    const prevCount = referrerUser.referralCount || 0;
+    const newCount = prevCount + 1;
+    referrerUser.referralCount = newCount;
+
+    const reward = getMilestoneReward(prevCount, newCount);
+
+    if (reward.isLifetime) {
+      referrerUser.isLifetimeAdFree = true;
+    } else if (reward.daysToAdd > 0) {
+      const now = Date.now();
+      const currentExpiry = referrerUser.adFreeUntil ? new Date(referrerUser.adFreeUntil).getTime() : now;
+      const baseTime = currentExpiry > now ? currentExpiry : now;
+      referrerUser.adFreeUntil = new Date(baseTime + reward.daysToAdd * 24 * 60 * 60 * 1000);
+    }
+
+    referrerUser.updatedAt = new Date();
+    await referrerUser.save();
+
+    console.log(`[REFERRAL] Successfully credited referral: Referrer ${cleanReferrerId} <- Referred ${referredUserId}. New Total: ${newCount}`);
+
+    // 4. Send Instant Telegram Notification Message to Referrer
+    if (botInstance) {
+      try {
+        const referredDisplayName = referredUserInfo.firstName ||
+          (referredUserInfo.username ? `@${referredUserInfo.username}` : `User ${referredUserId}`);
+        const statusLabel = getAdFreeStatusLabel(referrerUser);
+
+        let milestoneText = '';
+        if (reward.tierLabel) {
+          milestoneText = `\n\n🎁 <b>New Milestone Unlocked:</b> ${reward.tierLabel}!`;
+        }
+
+        const notifyMsg =
+          `🎉 <b>New Referral Alert!</b>\n\n` +
+          `User <b>${escapeHtml(referredDisplayName)}</b> has joined using your referral link!${milestoneText}\n\n` +
+          `👥 <b>Your Total Referrals:</b> <b>${newCount}</b>\n` +
+          `🛡 <b>Ad-Free Status:</b> ${escapeHtml(statusLabel)}\n\n` +
+          `<i>Keep sharing your referral link to unlock more Ad-Free rewards!</i>`;
+
+        botInstance.sendMessage(cleanReferrerId, notifyMsg, {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '👥 View Referrals', callback_data: 'menu_referrals' }]
+            ]
+          }
+        }).then(() => {
+          console.log(`[REFERRAL] Notification message sent to referrer ${cleanReferrerId}`);
+        }).catch((sendErr) => {
+          console.warn(`[REFERRAL] Could not send message to referrer ${cleanReferrerId}:`, sendErr.message);
+        });
+      } catch (notifyErr) {
+        console.error('[REFERRAL] Error building notification message:', notifyErr.message);
+      }
+    }
+
+    return {
+      success: true,
+      referrerId: cleanReferrerId,
+      referrerName: referrerUser.firstName || (referrerUser.username ? `@${referrerUser.username}` : null),
+      newCount
+    };
   } catch (err) {
     console.error('[REFERRAL] Error recording referral start:', err.message);
     return { error: err.message };
