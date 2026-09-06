@@ -2,6 +2,7 @@ const ForwardRule = require('../models/ForwardRule');
 const ProcessedMessage = require('../models/ProcessedMessage');
 const { processTextContent } = require('./branding');
 const { isDatabaseConnected } = require('./database');
+const { isPromotionalPost } = require('./adFilter');
 
 // In-memory buffer for album / media group aggregation
 const albumBuffer = new Map();
@@ -150,8 +151,24 @@ async function processSingleMessageForRule(message, client, rule, sourceIdentifi
       return;
     }
 
-    // 4 & 5. Prepare raw text and preserve formatting / captions
+    // 4. Analyze post text/caption for advertisement / promotion
     const rawText = message.message || '';
+    if (isPromotionalPost(rawText)) {
+      console.log(`[AD-FILTER] Promotional post detected - skipping (ID: ${message.id})`);
+      // Record skipped promotional post to prevent duplicate reprocessing
+      await ProcessedMessage.create({
+        ruleId: rule._id,
+        sourceChannelId: String(sourceIdentifier),
+        sourceMessageId: message.id,
+        destinationMessageId: null,
+        status: 'skipped'
+      }).catch(() => {});
+      return;
+    }
+
+    console.log(`[AD-FILTER] Normal post - forwarding (ID: ${message.id})`);
+
+    // 5. Prepare raw text and preserve formatting / captions
     const processedText = processTextContent(rawText, rule);
 
     let sentMessage = null;
@@ -245,8 +262,25 @@ async function processAlbumForRule(messages, client, rule, sourceIdentifier) {
   }
 
   try {
-    const firstMsg = unhandledMessages[0];
-    const rawCaption = firstMsg.message || '';
+    const rawCaption = unhandledMessages.find(m => m.message && m.message.trim().length > 0)?.message || unhandledMessages[0].message || '';
+
+    // Analyze album caption for advertisement / promotion
+    if (isPromotionalPost(rawCaption)) {
+      console.log(`[AD-FILTER] Promotional post detected - skipping (Album Message ID: ${unhandledMessages[0].id})`);
+      for (const msg of unhandledMessages) {
+        await ProcessedMessage.create({
+          ruleId: rule._id,
+          sourceChannelId: String(sourceIdentifier),
+          sourceMessageId: msg.id,
+          destinationMessageId: null,
+          status: 'skipped'
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    console.log(`[AD-FILTER] Normal post - forwarding (Album Message ID: ${unhandledMessages[0].id})`);
+
     const processedCaption = processTextContent(rawCaption, rule);
 
     const mediaGroup = [];
