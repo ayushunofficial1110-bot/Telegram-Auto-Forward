@@ -80,7 +80,15 @@ process.on('unhandledRejection', (reason) => {
   console.error('[ERROR] Unhandled Rejection:', reason ? (reason.stack || reason.message || reason) : 'Unknown unhandled rejection');
 });
 
+let isBootstrapped = false;
+
 async function bootstrap() {
+  if (isBootstrapped) {
+    console.log('[SERVER] Bootstrap already executed - skipping duplicate call');
+    return;
+  }
+  isBootstrapped = true;
+
   console.log('[SERVER] Starting Auto Reposter Application...');
 
   // 1. Start HTTP Express Server immediately for healthchecks and hosting probes

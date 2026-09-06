@@ -198,6 +198,28 @@ function setupCommandHandlers() {
     const chatId = msg.chat.id;
     sendHelpMessage(chatId);
   });
+
+  bot.onText(/^\/(?:settings|status)(?:@\w+)?(?:\s+(.*))?$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = String(msg.from.id);
+    let userDoc = null;
+    if (isDatabaseConnected()) {
+      userDoc = await User.findOne({ telegramUserId: userId }).catch(() => null);
+    }
+    if (isUserAdmin(userId, userDoc)) {
+      return showAdminStatus(chatId);
+    }
+    return bot.sendMessage(
+      chatId,
+      '⛔️ <b>Settings Restricted</b>\n\nAll system settings and diagnostics are managed exclusively inside the <b>Admin Panel</b>.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[{ text: '🔙 Main Menu', callback_data: 'menu_main' }]]
+        }
+      }
+    );
+  });
 }
 
 /**
@@ -220,10 +242,7 @@ async function sendMainMenu(chatId, name, isAdminFlag = null) {
       [{ text: '➕ Create Auto Forward', callback_data: 'menu_create' }],
       [{ text: '🔄 My Auto Forwards', callback_data: 'menu_list' }],
       [{ text: '👥 Refer & Earn', callback_data: 'menu_referrals' }],
-      [
-        { text: '💬 Contact Support', callback_data: 'menu_support' },
-        { text: '⚙️ Settings', callback_data: 'menu_settings' }
-      ]
+      [{ text: '💬 Contact Support', callback_data: 'menu_support' }]
     ]
   };
 
@@ -409,7 +428,7 @@ async function sendAdminPanel(chatId) {
       ],
       [
         { text: '👥 Referrals', callback_data: 'admin_referrals' },
-        { text: '⚙️ Bot Status', callback_data: 'admin_status' }
+        { text: '⚙️ Settings & System Status', callback_data: 'admin_settings' }
       ],
       [{ text: '🔙 Back to Main Menu', callback_data: 'menu_main' }]
     ]
@@ -599,7 +618,7 @@ async function showAdminReferrals(chatId) {
 }
 
 /**
- * Admin Panel: ⚙️ Bot Status
+ * Admin Panel: ⚙️ Settings & System Status
  */
 async function showAdminStatus(chatId) {
   const dbInfo = getDatabaseStatus();
@@ -609,21 +628,34 @@ async function showAdminStatus(chatId) {
   const uptimeHours = (process.uptime() / 3600).toFixed(2);
   const memUsageMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
 
+  let totalRules = 0;
+  let activeRules = 0;
+  let totalUsers = 0;
+  if (isDatabaseConnected()) {
+    try {
+      totalRules = await ForwardRule.countDocuments();
+      activeRules = await ForwardRule.countDocuments({ active: true });
+      totalUsers = await User.countDocuments();
+    } catch (_) {}
+  }
+
   const text =
-    `⚙️ <b>Bot System Diagnostics</b>\n\n` +
+    `⚙️ <b>Admin Settings & System Status</b>\n\n` +
     `• <b>Telegram Bot API:</b> ${botStatus}\n` +
     `• <b>MTProto Channel Listener:</b> ${mtprotoStatus}\n` +
     `• <b>MongoDB Atlas Database:</b> ${dbStatus}\n` +
+    `• <b>Forwarding Rules:</b> ${totalRules} total (${activeRules} active)\n` +
+    `• <b>Registered Users:</b> ${totalUsers}\n` +
     `• <b>Process Uptime:</b> ${uptimeHours} hours\n` +
     `• <b>Memory Usage (RSS):</b> ${memUsageMb} MB\n` +
     `• <b>Node.js Version:</b> ${process.version}\n\n` +
-    `<i>All services running with auto-reconnect protections.</i>`;
+    `<i>All core settings, diagnostics, and background daemons are managed exclusively through this admin console.</i>`;
 
   bot.sendMessage(chatId, text, {
     parse_mode: 'HTML',
     reply_markup: {
       inline_keyboard: [
-        [{ text: '🔄 Refresh Status', callback_data: 'admin_status' }],
+        [{ text: '🔄 Refresh Settings & Status', callback_data: 'admin_settings' }],
         [{ text: '🔙 Back to Admin Panel', callback_data: 'admin_panel' }]
       ]
     }
@@ -864,7 +896,20 @@ function setupCallbackQueryHandlers() {
     }
 
     if (data === 'menu_settings') {
-      return showSettings(chatId);
+      const userDoc = await User.findOne({ telegramUserId: userId }).catch(() => null);
+      if (isUserAdmin(userId, userDoc)) {
+        return showAdminStatus(chatId);
+      }
+      return bot.sendMessage(
+        chatId,
+        '⛔️ <b>Settings Restricted</b>\n\nAll system settings and diagnostics are managed exclusively inside the <b>Admin Panel</b>.',
+        {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[{ text: '🔙 Main Menu', callback_data: 'menu_main' }]]
+          }
+        }
+      );
     }
 
     if (data === 'menu_support') {
@@ -918,7 +963,7 @@ function setupCallbackQueryHandlers() {
         return showAdminReferrals(chatId);
       }
 
-      if (data === 'admin_status') {
+      if (data === 'admin_status' || data === 'admin_settings') {
         return showAdminStatus(chatId);
       }
 
@@ -1581,51 +1626,10 @@ async function deleteRule(chatId, userId, ruleId) {
 }
 
 /**
- * Shows settings and system diagnostic status.
+ * System diagnostic settings (restricted to Admin Panel).
  */
 async function showSettings(chatId) {
-  const dbInfo = getDatabaseStatus();
-  let dbStatus = '🔴 Disconnected';
-  if (dbInfo.connected) {
-    dbStatus = '🟢 Connected';
-  } else if (dbInfo.diagnostic === 'whitelist_required') {
-    dbStatus = '🟡 Whitelist Pending (Allow 0.0.0.0/0 in Atlas Network Access)';
-  } else if (dbInfo.state === 'connecting') {
-    dbStatus = '🟡 Connecting...';
-  }
-
-  const mtprotoStatus = isMTProtoConnected() ? '🟢 Connected (Listening)' : '🟠 Not Connected / Standing By';
-  const botStatus = botInfo ? `🟢 Online (@${botInfo.username})` : '🔴 Offline';
-
-  let totalRules = 0;
-  let activeRules = 0;
-
-  if (isDatabaseConnected()) {
-    try {
-      totalRules = await ForwardRule.countDocuments();
-      activeRules = await ForwardRule.countDocuments({ active: true });
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  const text =
-    `⚙️ <b>System Status & Diagnostics</b>\n\n` +
-    `• <b>Telegram Bot API:</b> ${botStatus}\n` +
-    `• <b>MTProto User Client:</b> ${mtprotoStatus}\n` +
-    `• <b>MongoDB Atlas:</b> ${dbStatus}\n` +
-    `• <b>Total Rules in DB:</b> ${totalRules} (${activeRules} active)\n\n` +
-    `<i>The system is configured to auto-reconnect continuously in the background.</i>`;
-
-  bot.sendMessage(chatId, text, {
-    parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🔄 Refresh Status', callback_data: 'menu_settings' }],
-        [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
-      ]
-    }
-  });
+  return showAdminStatus(chatId);
 }
 
 function escapeHtml(text) {
