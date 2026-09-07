@@ -1,4 +1,4 @@
-const { TelegramClient, sessions, events } = require('teleproto');
+const { TelegramClient, sessions, events, Api } = require('teleproto');
 const { StringSession } = sessions;
 const { NewMessage } = events;
 
@@ -8,6 +8,83 @@ let isInitializing = false;
 let isConnected = false;
 let isListenerStarted = false;
 let initPromise = null;
+let activeWatchDisposer = null;
+let currentWatchedList = [];
+let periodicSyncInterval = null;
+
+/**
+ * Normalizes a channel username or link to a clean identifier.
+ */
+function normalizeChannelIdentifier(input) {
+  if (!input) return '';
+  return String(input)
+    .trim()
+    .replace(/^https?:\/\/t\.me\//i, '')
+    .replace(/^@/, '')
+    .trim();
+}
+
+/**
+ * Synchronizes active source channels with teleproto's watch mechanism so that
+ * Telegram servers continuously stream live channel updates via getChannelDifference polling.
+ *
+ * @param {string[]} channelIdentifiers List of channel usernames or IDs
+ */
+async function syncWatchedChannels(channelIdentifiers) {
+  if (!clientInstance || !isConnected) return;
+  if (!Array.isArray(channelIdentifiers) || channelIdentifiers.length === 0) return;
+
+  const cleanChannels = [];
+  for (const item of channelIdentifiers) {
+    const clean = normalizeChannelIdentifier(item);
+    if (clean && !cleanChannels.includes(clean)) {
+      cleanChannels.push(clean);
+    }
+  }
+
+  if (cleanChannels.length === 0) return;
+
+  // Check if identical to currently watched channels
+  const isIdentical = cleanChannels.length === currentWatchedList.length &&
+    cleanChannels.every(c => currentWatchedList.includes(c));
+  if (isIdentical && activeWatchDisposer) {
+    return;
+  }
+
+  // Pre-resolve and warm entity cache in client memory for each channel
+  for (const ch of cleanChannels) {
+    try {
+      const entity = await clientInstance.getEntity(ch).catch(() => null);
+      if (entity && entity.id && clientInstance.updateManager) {
+        const channelIdStr = entity.id.toString();
+        const input = await clientInstance.getInputEntity(entity).catch(() => null);
+        if (input && input.channelId && input.accessHash) {
+          await clientInstance.updateManager.watchChannel(channelIdStr, new Api.InputChannel({
+            channelId: input.channelId,
+            accessHash: input.accessHash
+          })).catch(() => {});
+        }
+      }
+    } catch (_) {
+      // Individual channel pre-resolution failure should not halt the watch pipeline
+    }
+  }
+
+  try {
+    if (activeWatchDisposer) {
+      try {
+        activeWatchDisposer();
+      } catch (_) {}
+      activeWatchDisposer = null;
+    }
+
+    activeWatchDisposer = clientInstance.updates.watch(cleanChannels);
+    currentWatchedList = cleanChannels;
+    console.log(`[MTProto] Actively watching source channels for live posts: ${cleanChannels.map(c => `@${c}`).join(', ')}`);
+  } catch (watchErr) {
+    console.error('[ERROR] Failed to arm channel watches:', watchErr.message);
+  }
+}
 
 /**
  * Initializes and connects the Telegram MTProto client.
@@ -69,7 +146,7 @@ async function initTelegramClient(onNewMessageCallback) {
 
       // Instantiate exactly ONE TelegramClient instance
       clientInstance = new TelegramClient(stringSession, numericApiId, apiHash.trim(), {
-        connectionRetries: 5,
+        connectionRetries: 10,
         retryDelay: 3000,
         autoReconnect: true,
         useWSS: false,
@@ -83,6 +160,17 @@ async function initTelegramClient(onNewMessageCallback) {
       isConnected = true;
       console.log('[MTProto] Connected successfully');
 
+      // Verify authorization and prime session with Telegram servers
+      try {
+        const me = await clientInstance.getMe();
+        if (me) {
+          const usernameStr = me.username ? `@${me.username}` : `ID ${me.id}`;
+          console.log(`[MTProto] Session verified: ${me.firstName || ''} ${me.lastName || ''} (${usernameStr})`);
+        }
+      } catch (authErr) {
+        console.warn('[MTProto] Session verification warning:', authErr.message);
+      }
+
       // Register incoming message event handler exactly once
       if (!isListenerStarted && typeof onNewMessageCallback === 'function') {
         clientInstance.addEventHandler(async (event) => {
@@ -91,7 +179,7 @@ async function initTelegramClient(onNewMessageCallback) {
               await onNewMessageCallback(event.message, clientInstance);
             }
           } catch (eventError) {
-            console.error('[ERROR] MTProto message event handler encountered error:', eventError.message);
+            console.error('[ERROR] MTProto message event handler encountered error:', eventError.message, '\nstack=', eventError.stack);
           }
         }, new NewMessage({}));
 
@@ -123,6 +211,26 @@ async function initTelegramClient(onNewMessageCallback) {
 }
 
 /**
+ * Starts a periodic background sync for watched channels every 60 seconds.
+ */
+function startPeriodicChannelSync(syncCallback) {
+  if (periodicSyncInterval) return;
+  periodicSyncInterval = setInterval(async () => {
+    try {
+      if (isConnected && clientInstance && typeof syncCallback === 'function') {
+        await syncCallback();
+      }
+    } catch (err) {
+      console.error('[ERROR] Periodic channel sync error:', err.message);
+    }
+  }, 60000);
+
+  if (periodicSyncInterval.unref) {
+    periodicSyncInterval.unref();
+  }
+}
+
+/**
  * Validates and resolves a public Telegram channel by username or link.
  */
 async function resolvePublicChannel(channelIdentifier) {
@@ -131,7 +239,7 @@ async function resolvePublicChannel(channelIdentifier) {
   }
 
   try {
-    let clean = channelIdentifier.trim().replace(/^https?:\/\/t\.me\//i, '').replace(/^@/, '');
+    const clean = normalizeChannelIdentifier(channelIdentifier);
     const entity = await clientInstance.getEntity(clean);
 
     if (entity) {
@@ -158,6 +266,8 @@ function isMTProtoConnected() {
 
 module.exports = {
   initTelegramClient,
+  syncWatchedChannels,
+  startPeriodicChannelSync,
   resolvePublicChannel,
   getTelegramClient,
   isMTProtoConnected

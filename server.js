@@ -33,7 +33,7 @@ console.warn = function (...args) {
 const { connectDatabase, getDatabaseStatus } = require('./src/database');
 const { initBot, isBotConnected, getBotStatus } = require('./src/bot');
 const { initTelegramClient, isMTProtoConnected } = require('./src/telegramClient');
-const { setBotInstance, handleIncomingMessage } = require('./src/repostEngine');
+const { setBotInstance, handleIncomingMessage, refreshWatchedChannels } = require('./src/repostEngine');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -113,6 +113,10 @@ async function bootstrap() {
   // 4. Initialize MTProto client independently for receiving channel feeds
   initTelegramClient(async (message, client) => {
     await handleIncomingMessage(message, client);
+  }).then(async (mtprotoClient) => {
+    if (mtprotoClient) {
+      await refreshWatchedChannels();
+    }
   }).catch((err) => {
     console.error('[ERROR] [MTProto] Connection error:', err && err.message ? err.message : err);
   });

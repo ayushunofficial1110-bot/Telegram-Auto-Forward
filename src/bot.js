@@ -8,6 +8,7 @@ const Referral = require('../models/Referral');
 const PromotionHistory = require('../models/PromotionHistory');
 const { isDatabaseConnected, getDatabaseStatus } = require('./database');
 const { isMTProtoConnected, resolvePublicChannel } = require('./telegramClient');
+const { refreshWatchedChannels } = require('./repostEngine');
 const {
   recordReferralStart,
   completeReferralIfPending,
@@ -1508,6 +1509,11 @@ async function activateRule(chatId, userId, data) {
 
     console.log(`[BOT] New ForwardRule created: ${newRule.sourceChannelUsername} -> ${newRule.destinationChannelUsername} (Rule ID: ${newRule._id})`);
 
+    // Refresh watched MTProto channels dynamically
+    refreshWatchedChannels().catch((watchErr) => {
+      console.error('[MTProto] Error refreshing watched channels after rule creation:', watchErr.message);
+    });
+
     // Check and complete referral if pending (Rule 6: completes only after basic setup)
     completeReferralIfPending(userId, bot).catch((refErr) => {
       console.error('[REFERRAL] Error in completeReferralIfPending:', refErr.message);
@@ -1606,6 +1612,7 @@ async function toggleRuleStatus(chatId, userId, ruleId) {
     await rule.save();
 
     console.log(`[BOT] Rule ${rule._id} toggled active=${rule.active}`);
+    refreshWatchedChannels().catch(() => {});
     await showUserRules(chatId, userId);
   } catch (err) {
     bot.sendMessage(chatId, `❌ Error toggling rule: ${err.message}`);
@@ -1619,6 +1626,7 @@ async function deleteRule(chatId, userId, ruleId) {
   try {
     await ForwardRule.findOneAndDelete({ _id: ruleId, userId });
     console.log(`[BOT] Rule ${ruleId} deleted`);
+    refreshWatchedChannels().catch(() => {});
     await showUserRules(chatId, userId);
   } catch (err) {
     bot.sendMessage(chatId, `❌ Error deleting rule: ${err.message}`);
