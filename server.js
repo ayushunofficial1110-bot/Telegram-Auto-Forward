@@ -34,6 +34,7 @@ const { connectDatabase, getDatabaseStatus } = require('./src/database');
 const { initBot, isBotConnected, getBotStatus } = require('./src/bot');
 const { initTelegramClient, isMTProtoConnected } = require('./src/telegramClient');
 const { setBotInstance, handleIncomingMessage, refreshWatchedChannels } = require('./src/repostEngine');
+const { initReferralWatcher, setBotForWatcher } = require('./src/referralWatcher');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -100,13 +101,19 @@ async function bootstrap() {
   initBot().then((bot) => {
     if (bot) {
       setBotInstance(bot);
+      setBotForWatcher(bot);
+      initReferralWatcher(bot);
     }
   }).catch((err) => {
     console.error('[ERROR] [BOT] Startup error:', err && err.message ? err.message : err);
   });
 
   // 3. Connect to MongoDB Atlas independently (a database delay/failure will not prevent Telegram Bot from running)
-  connectDatabase().catch((err) => {
+  connectDatabase().then((connected) => {
+    if (connected) {
+      initReferralWatcher();
+    }
+  }).catch((err) => {
     console.error('[ERROR] [DATABASE] Connection error:', err && err.message ? err.message : err);
   });
 

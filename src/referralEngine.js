@@ -52,14 +52,16 @@ async function notifyAdmins(botInstance, messageHtml) {
 }
 
 /**
- * Parses and registers a pending referral link when a user sends /start REF_XXXX or /start ref_XXXX
+ * Processes a referral when a user sends /start REF_XXXX or /start ref_XXXX
  * 
  * Rules:
- * - Does NOT count referral immediately.
+ * - Counts referral IMMEDIATELY (no pending state).
  * - Prevents self-referral (referrer === referred).
- * - Existing users who already had an account/rules cannot be referred.
- * - One referred user = max 1 referral relationship (cannot be referred twice).
- * - Status is stored as 'pending'.
+ * - Prevents duplicate counting (a referred user is only counted once).
+ * - Immediately increments referrer's referralCount by 1.
+ * - Automatically applies milestone ad-free rewards in MongoDB (2 -> 1 week, 5 -> 3 weeks, 10 -> 2 months, 20 -> 5 months, 50 -> Lifetime).
+ * - Dispatches instant notifications to Referrer and Admin.
+ * - If milestone reached, notifies Referrer with clear confirmation: "Ab se 1 week tak ads nahi aayenge".
  */
 async function recordReferralStart(referredUserId, startParam, botInstance = null, referredUserInfo = {}) {
   if (!startParam) return null;
@@ -73,7 +75,7 @@ async function recordReferralStart(referredUserId, startParam, botInstance = nul
 
   const strReferredId = String(referredUserId);
 
-  // 1. Self-referral protection (Section 7)
+  // 1. Self-referral protection
   if (cleanReferrerId === strReferredId) {
     return { error: 'self_referral' };
   }
@@ -108,26 +110,7 @@ async function recordReferralStart(referredUserId, startParam, botInstance = nul
       return { error: 'self_referral' };
     }
 
-    // 3. Existing User Protection (Section 8)
-    // If user already existed prior to clicking this referral link
-    if (referredUserInfo && referredUserInfo.isExistingUser) {
-      console.log(`[REFERRAL] User ${strReferredId} is an existing user. Referral relationship not created.`);
-      return { error: 'existing_user' };
-    }
-
-    // Check if referred user already completed setup or has forward rules
-    const [existingUserDoc, existingRulesCount] = await Promise.all([
-      User.findOne({ telegramUserId: strReferredId }),
-      ForwardRule.countDocuments({ userId: strReferredId })
-    ]);
-
-    if (existingUserDoc && (existingUserDoc.setupCompleted || existingRulesCount > 0)) {
-      console.log(`[REFERRAL] User ${strReferredId} already completed setup or has rules. Referral rejected.`);
-      return { error: 'existing_user' };
-    }
-
-    // 4. Duplicate referral protection (Section 6 & 9)
-    // Check if a referral record already exists for this referred user
+    // 3. Duplicate referral protection: each user can only be referred once
     const existingReferral = await Referral.findOne({
       $or: [
         { referredUserId: strReferredId },
@@ -137,15 +120,11 @@ async function recordReferralStart(referredUserId, startParam, botInstance = nul
 
     if (existingReferral) {
       const existingRefId = existingReferral.referrerUserId || existingReferral.referrerId;
-      if (existingReferral.status === 'successful' || existingReferral.status === 'completed') {
-        console.log(`[REFERRAL] User ${strReferredId} already has a completed referral with ${existingRefId}`);
-        return { error: 'already_completed', referrerId: existingRefId };
-      }
-      console.log(`[REFERRAL] User ${strReferredId} already has a pending referral with ${existingRefId}`);
-      return { error: 'already_pending', referrerId: existingRefId };
+      console.log(`[REFERRAL] User ${strReferredId} was already referred previously by ${existingRefId}`);
+      return { error: 'already_referred', referrerId: existingRefId };
     }
 
-    // 5. Create PENDING referral record in MongoDB (Section 9)
+    // 4. Create COMPLETED referral record immediately in MongoDB
     const normalizedCode = rawParam.toUpperCase().startsWith('REF_')
       ? rawParam.toUpperCase()
       : `REF_${resolvedReferrerId}`;
@@ -156,8 +135,9 @@ async function recordReferralStart(referredUserId, startParam, botInstance = nul
       referredId: strReferredId,
       referredUserId: strReferredId,
       referralCode: normalizedCode,
-      status: 'pending',
-      rewardApplied: false,
+      status: 'completed',
+      rewardApplied: true,
+      completedAt: new Date(),
       createdAt: new Date()
     });
 
@@ -168,17 +148,145 @@ async function recordReferralStart(referredUserId, startParam, botInstance = nul
       { upsert: true }
     );
 
-    console.log(`[REFERRAL] Created pending referral: Referrer ${resolvedReferrerId} <- Referred ${strReferredId}`);
+    // 5. Immediately increment referrer's referralCount
+    const prevCount = referrerUser.referralCount || 0;
+    const newCount = prevCount + 1;
+    referrerUser.referralCount = newCount;
+
+    // 6. Check milestone rewards and automatically apply Ad-Free
+    const reward = getMilestoneReward(prevCount, newCount);
+
+    if (reward.milestoneReached) {
+      if (reward.isLifetime) {
+        referrerUser.isLifetimeAdFree = true;
+      } else if (reward.daysToAdd > 0) {
+        const now = Date.now();
+        const currentExpiry = referrerUser.adFreeUntil ? new Date(referrerUser.adFreeUntil).getTime() : now;
+        const baseTime = currentExpiry > now ? currentExpiry : now;
+        referrerUser.adFreeUntil = new Date(baseTime + reward.daysToAdd * 24 * 60 * 60 * 1000);
+      }
+    }
+
+    if (newCount >= 2 || referrerUser.isLifetimeAdFree || (referrerUser.adFreeUntil && new Date(referrerUser.adFreeUntil) > new Date())) {
+      referrerUser.adsFree = true;
+    }
+
+    referrerUser.updatedAt = new Date();
+    await referrerUser.save();
+
+    console.log(`[REFERRAL] Successful referral registered immediately: ${resolvedReferrerId} <- ${strReferredId}, total: ${newCount}, milestone: ${reward.tierLabel || 'None'}`);
+
+    // Prepare profile info for messages
+    const referredName = (referredUserInfo && referredUserInfo.firstName) || 'User';
+    const referredUsername = (referredUserInfo && referredUserInfo.username) || null;
+    const referredDisplayName = referredUsername ? `@${referredUsername}` : (referredName || `User ${strReferredId}`);
+
+    const referrerName = referrerUser.firstName || 'User';
+    const referrerUsername = referrerUser.username || null;
+    const currentRewardStatus = getCurrentRewardText(referrerUser, reward);
+    const nextMilestone = getNextMilestoneText(newCount);
+
+    // 7. Send Immediate Telegram Notifications
+    if (botInstance) {
+      // --- NOTIFY REFERRER ---
+      const referrerNotifyMsg =
+        `🎉 <b>New Referral!</b>\n\n` +
+        `<b>${escapeHtml(referredDisplayName)}</b> has joined Auto Reposter using your referral link!\n\n` +
+        `👥 <b>Successful Referrals:</b> <b>${newCount}</b>\n\n` +
+        `🎁 <b>Current Reward:</b>\n` +
+        `${escapeHtml(currentRewardStatus)}\n\n` +
+        `<b>Next milestone:</b>\n` +
+        `${escapeHtml(nextMilestone)}\n\n` +
+        `Keep sharing! 🚀`;
+
+      await botInstance.sendMessage(resolvedReferrerId, referrerNotifyMsg, {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🎁 Refer & Get Ad-Free', callback_data: 'menu_referrals' }]
+          ]
+        }
+      }).catch((sendErr) => {
+        console.warn(`[REFERRAL] Could not send message to referrer ${resolvedReferrerId}:`, sendErr.message);
+      });
+
+      // --- IF MILESTONE REACHED, NOTIFY REFERRER WITH SPECIAL UNLOCK MESSAGE ---
+      if (reward.milestoneReached) {
+        let hindiNotice = '';
+        if (newCount >= 50) {
+          hindiNotice = '⚡ <b>Aapko Lifetime Ad-Free status mil chuka hai! Aapke channels par kabhi promotional ads nahi aayenge!</b>';
+        } else if (newCount >= 20) {
+          hindiNotice = '⚡ <b>Ab se 5 months tak aapke channels par koi promotional ads nahi aayenge!</b>';
+        } else if (newCount >= 10) {
+          hindiNotice = '⚡ <b>Ab se 2 months tak aapke channels par koi promotional ads nahi aayenge!</b>';
+        } else if (newCount >= 5) {
+          hindiNotice = '⚡ <b>Ab se 3 weeks tak aapke channels par koi promotional ads nahi aayenge!</b>';
+        } else if (newCount >= 2) {
+          hindiNotice = '⚡ <b>Ab se 1 week (7 days) tak aapke channels par koi ads / promotions nahi aayenge!</b>';
+        }
+
+        const milestoneUserMsg =
+          `🎉 <b>Referral Reward Unlocked!</b>\n\n` +
+          `Aapne <b>${newCount} successful referrals</b> complete kar liye hain!\n\n` +
+          `🎁 <b>Reward:</b> <b>${reward.tierLabel}</b>\n\n` +
+          `${hindiNotice}\n\n` +
+          `🛡 Ad-Free status automatically activate ho gaya hai.\n\n` +
+          `<b>Next milestone:</b>\n` +
+          `${escapeHtml(nextMilestone)}`;
+
+        await botInstance.sendMessage(resolvedReferrerId, milestoneUserMsg, {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🎁 Refer & Get Ad-Free', callback_data: 'menu_referrals' }]
+            ]
+          }
+        }).catch((sendErr) => {
+          console.warn(`[REFERRAL] Could not send milestone message to referrer ${resolvedReferrerId}:`, sendErr.message);
+        });
+      }
+
+      // --- NOTIFY ADMIN ---
+      const adminNotifyMsg =
+        `🎯 <b>New Referral Alert</b>\n\n` +
+        `👤 <b>Referrer:</b>\n` +
+        `Name: ${escapeHtml(referrerName)}\n` +
+        `Username: ${referrerUsername ? '@' + escapeHtml(referrerUsername) : 'None'}\n` +
+        `Telegram ID: <code>${resolvedReferrerId}</code>\n\n` +
+        `👥 <b>Referred User:</b>\n` +
+        `Name: ${escapeHtml(referredName)}\n` +
+        `Username: ${referredUsername ? '@' + escapeHtml(referredUsername) : 'None'}\n` +
+        `Telegram ID: <code>${strReferredId}</code>\n\n` +
+        `🔗 <b>Referral Code:</b>\n` +
+        `<code>${escapeHtml(normalizedCode)}</code>\n\n` +
+        `📊 <b>Referrer's Total Referrals:</b> <b>${newCount}</b>\n\n` +
+        `🎁 <b>Current Reward:</b>\n` +
+        `${escapeHtml(currentRewardStatus)}`;
+
+      await notifyAdmins(botInstance, adminNotifyMsg);
+
+      if (reward.milestoneReached) {
+        const milestoneAdminMsg =
+          `🎁 <b>Referral Reward Unlocked</b>\n\n` +
+          `👤 <b>User:</b> ${referrerUsername ? '@' + escapeHtml(referrerUsername) : escapeHtml(referrerName)}\n` +
+          `Telegram ID: <code>${resolvedReferrerId}</code>\n` +
+          `Successful Referrals: <b>${newCount}</b>\n` +
+          `Reward: <b>${reward.tierLabel}</b> (Automatically Activated)`;
+
+        await notifyAdmins(botInstance, milestoneAdminMsg);
+      }
+    }
 
     return {
       success: true,
-      status: 'pending',
+      status: 'completed',
       referrerId: resolvedReferrerId,
-      referrerName: referrerUser.firstName || (referrerUser.username ? `@${referrerUser.username}` : null)
+      referrerName: referrerName,
+      newCount,
+      milestoneReward: reward.milestoneReached ? reward : null
     };
   } catch (err) {
     if (err.code === 11000) {
-      // Duplicate key race-condition handled cleanly
       console.log(`[REFERRAL] Duplicate referral registration prevented by unique index for user ${strReferredId}`);
       return { error: 'already_referred' };
     }
@@ -447,6 +555,9 @@ function getAdFreeStatusLabel(userDoc) {
     const dateStr = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
     return `🟢 Ad-Free Active (Until ${dateStr})`;
   }
+  if (userDoc.adsFree) {
+    return '🟢 Ad-Free Active (Threshold Met)';
+  }
   return 'Standard (Promotions Active)';
 }
 
@@ -464,8 +575,11 @@ function isChannelAdFree(userDoc, ruleDoc) {
     return { adFree: true, reason: 'Platform promotions toggled OFF by channel owner' };
   }
 
-  // 3. User ad-free reward status
+  // 3. User ad-free flag in MongoDB / reward status
   if (userDoc) {
+    if (userDoc.adsFree === true) {
+      return { adFree: true, reason: 'Channel owner has adsFree status enabled in MongoDB' };
+    }
     if (userDoc.isLifetimeAdFree) {
       return { adFree: true, reason: 'Channel owner has Lifetime Ad-Free status' };
     }
@@ -483,9 +597,30 @@ function escapeRegex(string) {
   return String(string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Automatically converts any legacy pending referral records to completed.
+ */
+async function migrateLegacyPendingReferrals() {
+  try {
+    const pending = await Referral.find({ status: 'pending' });
+    if (pending && pending.length > 0) {
+      console.log(`[REFERRAL] Migrating ${pending.length} pending referrals to completed status...`);
+      for (const ref of pending) {
+        ref.status = 'completed';
+        ref.rewardApplied = true;
+        ref.completedAt = new Date();
+        await ref.save();
+      }
+    }
+  } catch (err) {
+    console.warn('[REFERRAL] Migration warning:', err.message);
+  }
+}
+
 module.exports = {
   recordReferralStart,
   completeReferralIfPending,
+  migrateLegacyPendingReferrals,
   getAdFreeStatusLabel,
   isChannelAdFree,
   getMilestoneReward,

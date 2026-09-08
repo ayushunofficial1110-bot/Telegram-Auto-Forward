@@ -34,6 +34,11 @@ const UserSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  adsFree: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
   adFreeUntil: {
     type: Date,
     default: null
