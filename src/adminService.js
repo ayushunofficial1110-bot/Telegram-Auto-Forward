@@ -46,7 +46,7 @@ async function getSystemStatistics() {
     ForwardRule.countDocuments({ active: true }).catch(() => 0),
     ProcessedMessage.countDocuments().catch(() => 0),
     Referral.countDocuments().catch(() => 0),
-    Referral.countDocuments({ status: 'completed' }).catch(() => 0),
+    Referral.countDocuments({ status: { $in: ['successful', 'completed'] } }).catch(() => 0),
     User.countDocuments({ isLifetimeAdFree: true }).catch(() => 0),
     User.countDocuments({
       isLifetimeAdFree: false,

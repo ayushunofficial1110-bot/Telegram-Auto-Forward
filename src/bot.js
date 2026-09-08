@@ -13,7 +13,9 @@ const {
   recordReferralStart,
   completeReferralIfPending,
   getAdFreeStatusLabel,
-  isChannelAdFree
+  isChannelAdFree,
+  getNextMilestoneText,
+  getCurrentRewardText
 } = require('./referralEngine');
 const {
   isUserAdmin,
@@ -122,9 +124,18 @@ function setupCommandHandlers() {
     // Register or update user in MongoDB if connected
     if (isDatabaseConnected()) {
       try {
+        // Check if user already exists in DB prior to processing referral (Existing User Protection)
+        const existingUser = await User.findOne({ telegramUserId: userId });
+        const isExistingUser = !!existingUser;
+
         userDoc = await User.findOneAndUpdate(
           { telegramUserId: userId },
-          { username, firstName, updatedAt: new Date() },
+          {
+            username,
+            firstName,
+            updatedAt: new Date(),
+            $setOnInsert: { referralCode: `REF_${userId}` }
+          },
           { upsert: true, returnDocument: 'after' }
         );
 
@@ -132,24 +143,30 @@ function setupCommandHandlers() {
         if (startParam) {
           const refResult = await recordReferralStart(userId, startParam, bot, {
             username,
-            firstName
+            firstName,
+            isExistingUser
           });
 
           if (refResult && refResult.success) {
-            console.log(`[REFERRAL] Successfully credited referral: ${refResult.referrerId} <- ${userId}`);
+            console.log(`[REFERRAL] Pending referral registered: ${refResult.referrerId} <- ${userId}`);
             await bot.sendMessage(
               chatId,
-              `🎉 <b>Welcome!</b> You joined through an invite link. Enjoy auto-forwarding!`,
+              `🎉 <b>Welcome!</b> You joined through an invite link.\n\n` +
+              `Configure your first channel forwarding rule to complete setup and activate auto-forwarding!`,
               { parse_mode: 'HTML' }
             ).catch(() => {});
           } else if (refResult && refResult.error === 'self_referral') {
             await bot.sendMessage(
               chatId,
-              `⚠️ <i>Notice: You cannot refer yourself. Share your invite link with friends to earn Ad-Free rewards!</i>`,
+              `⚠️ <i>Notice: You cannot refer yourself. Share your referral link with friends to earn Ad-Free rewards!</i>`,
               { parse_mode: 'HTML' }
             ).catch(() => {});
-          } else if (refResult && refResult.error === 'already_referred') {
+          } else if (refResult && refResult.error === 'existing_user') {
+            console.log(`[REFERRAL] User ${userId} is an existing user. Referral relationship was not created.`);
+          } else if (refResult && (refResult.error === 'already_completed' || refResult.error === 'already_referred')) {
             console.log(`[REFERRAL] User ${userId} was already referred previously by ${refResult.referrerId}`);
+          } else if (refResult && refResult.error === 'already_pending') {
+            console.log(`[REFERRAL] User ${userId} already has pending referral under ${refResult.referrerId}`);
           }
         }
       } catch (err) {
@@ -242,7 +259,7 @@ async function sendMainMenu(chatId, name, isAdminFlag = null) {
     inline_keyboard: [
       [{ text: '➕ Create Auto Forward', callback_data: 'menu_create' }],
       [{ text: '🔄 My Auto Forwards', callback_data: 'menu_list' }],
-      [{ text: '👥 Refer & Earn', callback_data: 'menu_referrals' }],
+      [{ text: '🎁 Refer & Get Ad-Free', callback_data: 'menu_referrals' }],
       [{ text: '💬 Contact Support', callback_data: 'menu_support' }]
     ]
   };
@@ -278,7 +295,7 @@ function showContactSupport(chatId) {
 }
 
 /**
- * Refer & Earn display showing user's link, referral stats and milestones.
+ * Refer & Get Ad-Free primary menu screen.
  */
 async function showReferralsMenu(chatId, userId) {
   let userDoc = null;
@@ -287,33 +304,108 @@ async function showReferralsMenu(chatId, userId) {
   }
 
   const referralCount = userDoc ? (userDoc.referralCount || 0) : 0;
-  const statusLabel = getAdFreeStatusLabel(userDoc);
   const botUsername = (botInfo && botInfo.username) ? botInfo.username : 'auto_forward_free_bot';
-  const referralLink = `https://t.me/${botUsername}?start=ref_${userId}`;
-  const shareText = `🚀 Check out this Telegram Auto Reposter bot! Automatically repost channel posts with custom branding and footer.\n\nJoin here: ${referralLink}`;
+  const referralLink = `https://t.me/${botUsername}?start=REF_${userId}`;
+  const nextRewardText = getNextMilestoneText(referralCount);
+
+  const shareText =
+`🚀 Try Auto Reposter!
+
+Automatically forward new posts from selected Telegram channels to your own channel.
+
+Set it up once and let it run automatically.
+
+👉 Start here:
+${referralLink}`;
+
   const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent(shareText)}`;
 
   const text =
-    `👥 <b>Refer & Earn</b>\n\n` +
-    `Successful Referrals: <b>${referralCount}</b>\n` +
-    `🛡 Ad-Free Status: <b>${escapeHtml(statusLabel)}</b>\n\n` +
-    `🎁 <b>Your Rewards:</b>\n` +
-    `• 2 referrals ➔ 1 week ad-free\n` +
-    `• 5 referrals ➔ 3 weeks ad-free\n` +
-    `• 10 referrals ➔ 2 months ad-free\n` +
-    `• 20 referrals ➔ 5 months ad-free\n` +
-    `• 50 referrals ➔ Lifetime ad-free\n\n` +
-    `Your Referral Link:\n` +
-    `<code>${referralLink}</code>\n\n` +
-    `<i>Share your link with friends. When someone starts the bot using your link, your referral count increases immediately and unlocks Ad-Free rewards!</i>`;
+    `🎁 <b>Refer & Get Ad-Free</b>\n\n` +
+    `Invite other Telegram channel owners to use Auto Reposter.\n\n` +
+    `Your successful referrals:\n` +
+    `👥 <b>${referralCount}</b>\n\n` +
+    `🎁 <b>Rewards:</b>\n` +
+    `• 2 referrals → 7 Days Ad-Free\n` +
+    `• 5 referrals → 3 Weeks Ad-Free\n` +
+    `• 10 referrals → 2 Months Ad-Free\n` +
+    `• 20 referrals → 5 Months Ad-Free\n` +
+    `• 50 referrals → Lifetime Ad-Free\n\n` +
+    `Your next reward:\n` +
+    `<b>${escapeHtml(nextRewardText)}</b>\n\n` +
+    `🔗 <b>Your Referral Link:</b>\n` +
+    `<code>${referralLink}</code>`;
 
   bot.sendMessage(chatId, text, {
     parse_mode: 'HTML',
     reply_markup: {
       inline_keyboard: [
-        [{ text: '📲 Share Referral Link', url: shareUrl }],
-        [{ text: '🔄 Refresh', callback_data: 'menu_referrals' }],
-        [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+        [{ text: '🔗 Share Referral Link', url: shareUrl }],
+        [{ text: '📊 My Referral Status', callback_data: 'referral_status' }],
+        [{ text: '⬅️ Back', callback_data: 'menu_main' }]
+      ]
+    }
+  });
+}
+
+/**
+ * Detailed referral status, pending counts, and tier unlocks.
+ */
+async function showUserReferralStatus(chatId, userId) {
+  let userDoc = null;
+  let pendingCount = 0;
+  if (isDatabaseConnected()) {
+    userDoc = await User.findOne({ telegramUserId: userId });
+    pendingCount = await Referral.countDocuments({
+      $or: [
+        { referrerUserId: String(userId) },
+        { referrerId: String(userId) }
+      ],
+      status: 'pending'
+    });
+  }
+
+  const referralCount = userDoc ? (userDoc.referralCount || 0) : 0;
+  const statusLabel = getAdFreeStatusLabel(userDoc);
+  const botUsername = (botInfo && botInfo.username) ? botInfo.username : 'auto_forward_free_bot';
+  const referralLink = `https://t.me/${botUsername}?start=REF_${userId}`;
+  const nextRewardText = getNextMilestoneText(referralCount);
+
+  const shareText =
+`🚀 Try Auto Reposter!
+
+Automatically forward new posts from selected Telegram channels to your own channel.
+
+Set it up once and let it run automatically.
+
+👉 Start here:
+${referralLink}`;
+
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent(shareText)}`;
+
+  const text =
+    `📊 <b>My Referral Status</b>\n\n` +
+    `👥 <b>Successful Referrals:</b> <b>${referralCount}</b>\n` +
+    `⏳ <b>Pending Referrals:</b> <b>${pendingCount}</b>\n` +
+    `🛡 <b>Current Ad-Free Status:</b> <b>${escapeHtml(statusLabel)}</b>\n\n` +
+    `🎁 <b>Rewards:</b>\n` +
+    `• 2 referrals → 7 Days Ad-Free ${referralCount >= 2 ? '✅' : '🔒'}\n` +
+    `• 5 referrals → 3 Weeks Ad-Free ${referralCount >= 5 ? '✅' : '🔒'}\n` +
+    `• 10 referrals → 2 Months Ad-Free ${referralCount >= 10 ? '✅' : '🔒'}\n` +
+    `• 20 referrals → 5 Months Ad-Free ${referralCount >= 20 ? '✅' : '🔒'}\n` +
+    `• 50 referrals → Lifetime Ad-Free ${referralCount >= 50 ? '✅' : '🔒'}\n\n` +
+    `Your next reward:\n` +
+    `<b>${escapeHtml(nextRewardText)}</b>\n\n` +
+    `🔗 <b>Your Referral Link:</b>\n` +
+    `<code>${referralLink}</code>`;
+
+  bot.sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🔗 Share Referral Link', url: shareUrl }],
+        [{ text: '🔄 Refresh', callback_data: 'referral_status' }],
+        [{ text: '⬅️ Back', callback_data: 'menu_referrals' }]
       ]
     }
   });
@@ -348,7 +440,7 @@ async function showPlatformPromotions(chatId, userId) {
     reply_markup: {
       inline_keyboard: [
         [{ text: toggleText, callback_data: 'toggle_promo_pref' }],
-        [{ text: '👥 Refer & Earn (Unlock Ad-Free)', callback_data: 'menu_referrals' }],
+        [{ text: '🎁 Refer & Get Ad-Free', callback_data: 'menu_referrals' }],
         [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
       ]
     }
@@ -585,14 +677,14 @@ async function showAdminRules(chatId) {
 async function showAdminReferrals(chatId) {
   const [totalRefs, completedRefs, topReferrers] = await Promise.all([
     Referral.countDocuments(),
-    Referral.countDocuments({ status: 'completed' }),
+    Referral.countDocuments({ status: { $in: ['successful', 'completed'] } }),
     User.find({ referralCount: { $gt: 0 } }).sort({ referralCount: -1 }).limit(10)
   ]);
 
   let text =
     `👥 <b>Referral System Overview</b>\n\n` +
     `• Total Referrals: <b>${totalRefs}</b>\n` +
-    `• Completed (Rewarded): <b>${completedRefs}</b>\n` +
+    `• Successful (Rewarded): <b>${completedRefs}</b>\n` +
     `• Pending Setup: <b>${totalRefs - completedRefs}</b>\n\n` +
     `🏆 <b>Top Referrers:</b>\n`;
 
@@ -919,6 +1011,10 @@ function setupCallbackQueryHandlers() {
 
     if (data === 'menu_referrals') {
       return showReferralsMenu(chatId, userId);
+    }
+
+    if (data === 'referral_status') {
+      return showUserReferralStatus(chatId, userId);
     }
 
     if (data === 'menu_promotions') {

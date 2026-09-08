@@ -12,9 +12,21 @@ const ReferralSchema = new mongoose.Schema({
     unique: true,
     index: true
   },
+  referrerUserId: {
+    type: String,
+    index: true
+  },
+  referredUserId: {
+    type: String,
+    index: true
+  },
+  referralCode: {
+    type: String,
+    default: null
+  },
   status: {
     type: String,
-    enum: ['pending', 'completed'],
+    enum: ['pending', 'successful', 'completed'],
     default: 'pending',
     index: true
   },
@@ -29,6 +41,22 @@ const ReferralSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now
+  }
+});
+
+// Middleware to keep referrerId and referrerUserId in sync, and referredId and referredUserId in sync
+ReferralSchema.pre('save', function () {
+  if (!this.referrerUserId && this.referrerId) {
+    this.referrerUserId = this.referrerId;
+  }
+  if (!this.referrerId && this.referrerUserId) {
+    this.referrerId = this.referrerUserId;
+  }
+  if (!this.referredUserId && this.referredId) {
+    this.referredUserId = this.referredId;
+  }
+  if (!this.referredId && this.referredUserId) {
+    this.referredId = this.referredUserId;
   }
 });
 
